@@ -1,4 +1,235 @@
-# Foundry IQ Azure AI Agent — Lab Notes
+# Lab 3 - Extend Agents with MCP Tools Notes
+
+A walkthrough of Microsoft's "Extend agents with Model Context Protocol (MCP) tools" tutorial, covering both connecting to a remote MCP server and building a custom one.
+
+---
+Builds two AI agent configurations in Microsoft Foundry:
+
+1. **Remote MCP Agent** — connects to Microsoft's official Learn Docs MCP server to retrieve up-to-date technical documentation
+2. **Custom MCP Agent** — connects to a locally-hosted custom MCP server with inventory and sales tools for a simulated retail store
+
+Both agents are built and run entirely from VS Code using the Foundry Toolkit extension.
+
+---
+
+## Resources Created in Azure
+
+| Resource | Type | Notes |
+|---|---|---|
+| Foundry project | Azure AI Foundry | Created via VS Code extension |
+| gpt-4.1 deployment | Azure OpenAI | Global Standard or Standard tier |
+
+---
+
+## Tools & Extensions Used
+
+| Tool | Purpose |
+|---|---|
+| Foundry Toolkit (VS Code extension) | Create project, deploy model, copy endpoint |
+| Python `azure-ai-projects` | Connect to Foundry and manage agents |
+| Python `fastmcp` | Build and run the custom MCP server |
+| Python `mcp` | MCP client session management |
+| Microsoft Learn Docs MCP server | Remote MCP server at `https://learn.microsoft.com/api/mcp` |
+
+---
+
+## Steps Completed
+
+### 1. Installed the Foundry Toolkit VS Code Extension
+- Opened Extensions panel (`Ctrl+Shift+X`)
+- Searched for and installed **Foundry Toolkit** by Microsoft
+- Signed into Azure account through the extension
+
+### 2. Created a Foundry Project
+- Used **Create Project** in the Foundry Toolkit pane
+- Selected Azure subscription and resource group
+- Entered a project name to deploy
+
+### 3. Deployed gpt-5.1
+- Opened the Model Catalog via the Foundry Toolkit
+- Located and deployed **gpt-5.1**
+- Deployment type: Global Standard (or Standard if unavailable)
+- Copied the **Project Endpoint** from the deployed model (right-click → Copy Project Endpoint)
+
+### 4. Cloned the Starter Code
+- Cloned `https://github.com/MicrosoftLearning/mslearn-ai-agents`
+- Opened the `Labfiles/03-mcp-integration/Python` folder in VS Code
+- Populated `.env` with the project endpoint and model deployment name
+
+### 5. Set Up the Virtual Environment
+```bash
+python3 -m venv labenv
+source labenv/bin/activate        # Linux/Mac
+# OR on Windows:
+.\labenv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+---
+
+## Part 1: Remote MCP Server (agent.py)
+
+### What it does
+Connects to Microsoft's Learn Docs MCP server and asks the agent to retrieve Azure CLI commands for creating a Container App with a managed identity.
+
+### Key code pieces added to `agent.py`
+
+**Imports:**
+```python
+from azure.identity import DefaultAzureCredential
+from azure.ai.projects import AIProjectClient
+from azure.ai.projects.models import PromptAgentDefinition, MCPTool
+from openai.types.responses.response_input_param import McpApprovalResponse, ResponseInputParam
+```
+
+**Connect to project:**
+```python
+with (
+    DefaultAzureCredential() as credential,
+    AIProjectClient(endpoint=project_endpoint, credential=credential) as project_client,
+    project_client.get_openai_client() as openai_client,
+):
+```
+
+**Initialize MCP tool pointing to Microsoft Learn Docs:**
+```python
+mcp_tool = MCPTool(
+    server_label="api-specs",
+    server_url="https://learn.microsoft.com/api/mcp",
+    require_approval="always",
+)
+```
+
+**Create agent with MCP tool:**
+```python
+agent = project_client.agents.create_version(
+    agent_name="MyAgent",
+    definition=PromptAgentDefinition(
+        model=model_deployment,
+        instructions="You are a helpful agent...",
+        tools=[mcp_tool],
+    ),
+)
+```
+
+**Handle MCP approval requests and get final response:**
+- Listens for `mcp_approval_request` items in the response output
+- Automatically approves them by sending back `mcp_approval_response`
+- Retrieves the final response after approval
+
+### How to run
+```bash
+az login
+python3 agent.py
+```
+
+### Sample output
+The agent retrieved and returned Azure CLI commands for creating a Container App with managed identity, sourced directly from Microsoft's documentation.
+
+---
+
+## Part 2: Custom MCP Server (server.py + client.py)
+
+### What it does
+Defines a local MCP server with two custom tools — inventory levels and weekly sales — then connects an agent to it to answer retail inventory questions.
+
+### server.py — Custom MCP Server
+
+Defines two tools using the `@mcp.tool()` decorator, registered on a `FastMCP` server named "Inventory":
+
+- `get_inventory_levels()` — returns current stock quantities per product
+- `get_weekly_sales()` — returns weekly sales figures per product
+
+```python
+from fastmcp import FastMCP
+mcp = FastMCP(name="Inventory")
+
+@mcp.tool()
+def get_inventory_levels() -> dict:
+    # returns inventory data
+
+@mcp.tool()
+def get_weekly_sales() -> dict:
+    # returns sales data
+
+mcp.run()
+```
+
+### client.py — MCP Client + Agent
+
+**Connects to the server via stdio transport:**
+```python
+stdio_transport = await exit_stack.enter_async_context(stdio_client(server_params))
+session = await exit_stack.enter_async_context(ClientSession(stdio, write))
+await session.initialize()
+```
+
+**Discovers available tools and wraps them as callable functions:**
+```python
+def make_tool_func(tool_name):
+    async def tool_func(**kwargs):
+        result = await session.call_tool(tool_name, kwargs)
+        return result
+    tool_func.__name__ = tool_name
+    return tool_func
+```
+
+**Creates the agent with inventory-focused instructions:**
+```python
+agent = project_client.agents.create_version(
+    agent_name="inventory-agent",
+    definition=PromptAgentDefinition(
+        model=model_deployment,
+        instructions="""
+        You are an inventory assistant.
+        - Recommend restock if item inventory < 10 and weekly sales > 15
+        - Recommend clearance if item inventory > 20 and weekly sales < 5
+        """,
+        tools=mcp_function_tools
+    ),
+)
+```
+
+**Processes function calls from the agent response and sends results back.**
+
+### How to run
+```bash
+python3 client.py
+```
+
+### Sample prompts tested
+- `Show me the current inventory levels for all products.`
+- `Are there any products that should be restocked?`
+- `Which products would you recommend for clearance?`
+- `What are the best sellers this week?`
+
+The agent used the MCP tools to retrieve data and applied the restock/clearance rules from its instructions to give actionable recommendations.
+
+---
+
+## Key Concepts
+
+**MCP (Model Context Protocol)** — a standard that lets AI agents discover and call external tools, either hosted remotely or locally.
+
+**Remote MCP server** — a cloud-hosted service (like Microsoft Learn Docs) that the agent calls over HTTP. Requires approval handling.
+
+**Custom MCP server** — a locally-run Python process exposing functions via `@mcp.tool()`. The client starts the server via stdio transport and the agent calls tools dynamically.
+
+**MCP approval flow** — when `require_approval="always"` is set, the agent pauses and requests user (or programmatic) approval before invoking a tool. The client sends back an `mcp_approval_response` to proceed.
+
+---
+
+## Approximate Cost
+
+| Resource | Cost |
+|---|---|
+| gpt-4.1 tokens (light testing) | ~$0.10–0.50 |
+| Foundry project (short session) | minimal |
+| **Total** | **~$0.50–1.00** |
+
+No persistent search or storage resources were created in this lab, so costs are lower than the Foundry IQ lab. Delete the resource group when done to avoid any ongoing charges.
+
+# Lab 4 - Foundry IQ Azure AI Agent Notes
 
 A walkthrough of Microsoft's "Integrate an AI agent with Foundry IQ" tutorial, including the real-world issues encountered and how they were resolved.
 
